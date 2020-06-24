@@ -227,18 +227,47 @@ static bool ioeventfd_enabled(void)
     return !kvm_enabled() || kvm_eventfds_enabled();
 }
 
+static void slave_read(void *opaque);
+
 static int vhost_user_read_header(struct vhost_dev *dev, VhostUserMsg *msg)
 {
     struct vhost_user *u = dev->opaque;
     CharBackend *chr = u->user->chr;
     uint8_t *p = (uint8_t *) msg;
     int r, size = VHOST_USER_HDR_SIZE;
+    int bytes;
 
-    r = qemu_chr_fe_read_all(chr, p, size);
-    if (r != size) {
-        error_report("Failed to read msg header. Read %d instead of %d."
-                     " Original request %d.", r, size, msg->hdr.request);
-        return -1;
+    while (1) {
+        /* get available bytes ready to read */
+        r = CHARDEV_GET_CLASS(chr->chr)->chr_peek(chr->chr);
+        if (r < 0) {
+            error_report("Failed to read msg bytes %d", r);
+            return -1;
+        } else if (r) { /* master message available */
+            r = qemu_chr_fe_read_all(chr, p, size);
+            if (r != size) {
+                error_report("Failed to read msg header. Read %d instead of %d."
+                             " Original request %d.", r, size,
+                             msg->hdr.request);
+                return -1;
+            } else {
+                break;
+            }
+        } else { /* no message, peek client message */
+            if (u->slave_fd >= 0) {
+                r = ioctl(u->slave_fd, FIONREAD, &bytes);
+                if (r)  {
+                    error_report("Failed to read client msg bytes %d", r);
+                    return -1;
+                }
+                if (bytes) {
+                    /* Client message available */
+                    slave_read(dev);
+                    continue;
+                }
+            }
+            g_usleep(100);
+        }
     }
 
     /* validate received flags */
@@ -1107,7 +1136,6 @@ static void slave_read(void *opaque)
     return;
 
 err:
-    qemu_set_fd_handler(u->slave_fd, NULL, NULL, NULL);
     close(u->slave_fd);
     u->slave_fd = -1;
     for (i = 0; i < fdsize; i++) {
@@ -1140,7 +1168,6 @@ static int vhost_setup_slave_channel(struct vhost_dev *dev)
     }
 
     u->slave_fd = sv[0];
-    qemu_set_fd_handler(u->slave_fd, slave_read, NULL, dev);
 
     if (reply_supported) {
         msg.hdr.flags |= VHOST_USER_NEED_REPLY_MASK;
@@ -1158,7 +1185,6 @@ static int vhost_setup_slave_channel(struct vhost_dev *dev)
 out:
     close(sv[1]);
     if (ret) {
-        qemu_set_fd_handler(u->slave_fd, NULL, NULL, NULL);
         close(u->slave_fd);
         u->slave_fd = -1;
     }
@@ -1389,7 +1415,7 @@ static int vhost_user_postcopy_notifier(NotifierWithReturn *notifier,
 
 static int vhost_user_backend_init(struct vhost_dev *dev, void *opaque)
 {
-    uint64_t features, protocol_features;
+    uint64_t features = 0, protocol_features;
     struct vhost_user *u;
     int err;
 
@@ -1490,7 +1516,6 @@ static int vhost_user_backend_cleanup(struct vhost_dev *dev)
         u->postcopy_fd.handler = NULL;
     }
     if (u->slave_fd >= 0) {
-        qemu_set_fd_handler(u->slave_fd, NULL, NULL, NULL);
         close(u->slave_fd);
         u->slave_fd = -1;
     }
